@@ -59,41 +59,40 @@
 //!     connect(srv, cli);
 //! }
 //! ```
-#![cfg_attr(feature = "cargo-clippy", allow(type_complexity))]
-extern crate crossbeam_channel;
-
 use std::{marker, mem, ptr};
 use std::thread::spawn;
 use std::marker::PhantomData;
-
 use std::collections::HashMap;
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
-
-use crossbeam_channel::Select;
+use ipc_channel::ipc::{bytes_channel as channel, IpcBytesSender as Sender, IpcBytesReceiver as Receiver};
 
 pub use Branch::*;
 
 /// A session typed channel. `P` is the protocol and `E` is the environment,
 /// containing potential recursion targets
 #[must_use]
-pub struct Chan<E, P>(Sender<*mut u8>, Receiver<*mut u8>, PhantomData<(E, P)>);
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Chan<E, P>(Sender, Receiver, PhantomData<(E, P)>);
 
 unsafe impl<E: marker::Send, P: marker::Send> marker::Send for Chan<E, P> {}
 
-unsafe fn write_chan<A: marker::Send + 'static, E, P>(&Chan(ref tx, _, _): &Chan<E, P>, x: A) {
-    tx.send(Box::into_raw(Box::new(x)) as *mut _).unwrap()
+unsafe fn write_chan<A: serde::Serialize, E, P>(&Chan(ref tx, _, _): &Chan<E, P>, x: A) {
+    let bytes = bincode::serialize(&x).unwrap();
+    tx.send(&bytes[..]).unwrap()
 }
 
-unsafe fn read_chan<A: marker::Send + 'static, E, P>(&Chan(_, ref rx, _): &Chan<E, P>) -> A {
-    *Box::from_raw(rx.recv().unwrap() as *mut A)
+unsafe fn read_chan<A, E, P>(&Chan(_, ref rx, _): &Chan<E, P>) -> A
+where for<'de> A: serde::Deserialize<'de> {
+    let bytes = rx.recv().unwrap();
+    bincode::deserialize(&bytes[..]).unwrap()
 }
 
-unsafe fn try_read_chan<A: marker::Send + 'static, E, P>(
+unsafe fn try_read_chan<A, E, P>(
     &Chan(_, ref rx, _): &Chan<E, P>,
-) -> Option<A> {
+) -> Option<A>
+where for<'de> A: serde::Deserialize<'de> {
     match rx.try_recv() {
-        Ok(a) => Some(*Box::from_raw(a as *mut A)),
+        Ok(bytes) => Some(bincode::deserialize(&bytes[..]).unwrap()),
         Err(_) => None,
     }
 }
@@ -203,7 +202,7 @@ impl<E, P> Chan<E, P> {
     }
 }
 
-impl<E, P, A: marker::Send + 'static> Chan<E, Send<A, P>> {
+impl<E, P, A: serde::Serialize> Chan<E, Send<A, P>> {
     /// Send a value of type `A` over the channel. Returns a channel with
     /// protocol `P`
     #[must_use]
@@ -215,7 +214,8 @@ impl<E, P, A: marker::Send + 'static> Chan<E, Send<A, P>> {
     }
 }
 
-impl<E, P, A: marker::Send + 'static> Chan<E, Recv<A, P>> {
+impl<E, P, A> Chan<E, Recv<A, P>>
+where for<'de> A: serde::Deserialize<'de> {
     /// Receives a value of type `A` from the channel. Returns a tuple
     /// containing the resulting channel and the received value.
     #[must_use]
@@ -390,25 +390,23 @@ pub fn hselect<E, P, A>(
 /// An alternative version of homogeneous select, returning the index of the Chan
 /// that is ready to receive.
 pub fn iselect<E, P, A>(chans: &Vec<Chan<E, Recv<A, P>>>) -> usize {
-    let mut map = HashMap::new();
+    // let mut map = HashMap::new();
 
     let id = {
-        let mut sel = Select::new();
-        let mut handles = Vec::with_capacity(chans.len()); // collect all the handles
+        let mut sel = unimplemented!("Select is not implemented for IPC channels"); // Select::new();
+        // let mut handles = Vec::with_capacity(chans.len()); // collect all the handles
 
-        for (i, chan) in chans.iter().enumerate() {
-            let &Chan(_, ref rx, _) = chan;
-            let handle = sel.recv(rx);
-            map.insert(handle, i);
-            handles.push(handle);
-        }
+        // for (i, chan) in chans.iter().enumerate() {
+        //     let &Chan(_, ref rx, _) = chan;
+        //     let handle = sel.recv(rx);
+        //     map.insert(handle, i);
+        //     handles.push(handle);
+        // }
 
-        let id = sel.ready();
-
-
-        id
+        // let id = sel.ready();
+        // id
     };
-    map.remove(&id).unwrap()
+    // map.remove(&id).unwrap()
 }
 
 /// Heterogeneous selection structure for channels
@@ -421,7 +419,7 @@ pub fn iselect<E, P, A>(chans: &Vec<Chan<E, Recv<A, P>>>) -> usize {
 /// The type parameter T is a return type, ie we store a value of some type T
 /// that is returned in case its associated channels is selected on `wait()`
 pub struct ChanSelect<'c> {
-    receivers: Vec<&'c Receiver<*mut u8>>,
+    receivers: Vec<&'c Receiver>,
 }
 
 impl<'c> ChanSelect<'c> {
@@ -448,12 +446,11 @@ impl<'c> ChanSelect<'c> {
     /// This method consumes the ChanSelect, freeing up the borrowed Receivers
     /// to be consumed.
     pub fn wait(self) -> usize {
-        let mut sel = Select::new();
-        for rx in self.receivers.into_iter() {
-            sel.recv(rx);
-        }
-
-        sel.ready()
+        let mut sel = unimplemented!("Select is not implemented for IPC channels"); // Select::new();
+        // for rx in self.receivers.into_iter() {
+        //     sel.recv(rx);
+        // }
+        // sel.ready()
     }
 
     /// How many channels are there in the structure?
@@ -462,30 +459,30 @@ impl<'c> ChanSelect<'c> {
     }
 }
 
-/// Returns two session channels
 #[must_use]
-pub fn session_channel<P: HasDual>() -> (Chan<(), P>, Chan<(), P::Dual>) {
-    let (tx1, rx1) = unbounded();
-    let (tx2, rx2) = unbounded();
+pub fn session_channel<P: HasDual>() -> std::io::Result<(Chan<(), P>, Chan<(), P::Dual>)> {
+    let (tx1, rx1) = channel()?;
+    let (tx2, rx2) = channel()?;
 
     let c1 = Chan(tx1, rx2, PhantomData);
     let c2 = Chan(tx2, rx1, PhantomData);
 
-    (c1, c2)
+    Ok((c1, c2))
 }
 
 /// Connect two functions using a session typed channel.
-pub fn connect<F1, F2, P>(srv: F1, cli: F2)
+pub fn connect<F1, F2, P>(srv: F1, cli: F2) -> std::io::Result<()>
 where
     F1: Fn(Chan<(), P>) + marker::Send + 'static,
     F2: Fn(Chan<(), P::Dual>) + marker::Send,
     P: HasDual + marker::Send + 'static,
     P::Dual: HasDual + marker::Send + 'static
 {
-    let (c1, c2) = session_channel();
+    let (c1, c2) = session_channel()?;
     let t = spawn(move || srv(c1));
     cli(c2);
     t.join().unwrap();
+    Ok(())
 }
 
 mod private {

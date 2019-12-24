@@ -3,17 +3,21 @@ name = "session_types"
 version = "0.3.1"
 authors = [ "Philip Munksgaard <pmunksgaard@gmail.com>"
           , "Thomas Bracht Laumann Jespersen <laumann.thomas@gmail.com>"
+          , "Cameron Eldridge <cam.eldridge@gmail.com>"
           ]
 
 description = "An implementation of session types in Rust"
-repository = "https://github.com/Munksgaard/session-types"
+repository = "https://github.com/foxfriends/session-types"
 readme = "README.md"
 keywords = ["session", "types", "channels", "concurrency", "communication"]
+edition = "2018"
 
 license = "MIT"
 
 [dependencies]
-crossbeam-channel = "0.3.3"
+ipc-channel = "0.13"
+serde = "1.0"
+bincode = "1.2.1"
 
 [dev-dependencies]
 compiletest_rs = { version = "0.3.16", features = ["stable"] }
