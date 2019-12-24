@@ -173,12 +173,6 @@ pub enum Branch<L, R> {
     Right(R),
 }
 
-impl<E, P> Drop for Chan<E, P> {
-    fn drop(&mut self) {
-        panic!("Session channel prematurely dropped");
-    }
-}
-
 impl<E> Chan<E, Eps> {
     /// Close a channel. Should always be used at the end of your program.
     pub fn close(self) {
