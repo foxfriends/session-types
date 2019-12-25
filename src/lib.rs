@@ -59,10 +59,10 @@
 //!     connect(srv, cli);
 //! }
 //! ```
-use std::{marker, mem, ptr};
+use std::marker;
 use std::thread::spawn;
 use std::marker::PhantomData;
-use std::collections::HashMap;
+// use std::collections::HashMap;
 
 use ipc_channel::ipc::{channel, IpcSender as Sender, IpcReceiver as Receiver};
 
@@ -183,21 +183,23 @@ impl<E> Chan<E, Eps> {
     pub fn close(self) {
         // This method cleans up the channel without running the panicky destructor
         // In essence, it calls the drop glue bypassing the `Drop::drop` method
+        //
+        // Except, the panicky destructor has been removed for the IPC layer, so
+        // this doesn't do anything now!
 
-        let this = mem::ManuallyDrop::new(self);
+        // let this = mem::ManuallyDrop::new(self);
 
-        let sender = unsafe { ptr::read(&(this).0 as *const _) };
-        let receiver = unsafe { ptr::read(&(this).1 as *const _) };
+        // let sender = unsafe { ptr::read(&(this).0 as *const _) };
+        // let receiver = unsafe { ptr::read(&(this).1 as *const _) };
 
-        drop(sender);
-        drop(receiver); // drop them
+        // drop(sender);
+        // drop(receiver); // drop them
     }
 }
 
 impl<E, P> Chan<E, P> {
     unsafe fn cast<E2, P2>(self) -> Chan<E2, P2> {
-        let this = mem::ManuallyDrop::new(self);
-        Chan(ptr::read(&(this).0 as *const _), ptr::read(&(this).1 as *const _), PhantomData)
+        Chan(self.0, self.1, PhantomData)
     }
 }
 
