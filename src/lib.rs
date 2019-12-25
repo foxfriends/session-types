@@ -64,27 +64,32 @@ use std::thread::spawn;
 use std::marker::PhantomData;
 use std::collections::HashMap;
 
-use ipc_channel::ipc::{bytes_channel as channel, IpcBytesSender as Sender, IpcBytesReceiver as Receiver};
+use ipc_channel::ipc::{channel, IpcSender as Sender, IpcReceiver as Receiver};
 
 pub use Branch::*;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Packet {
+    content: String,
+}
 
 /// A session typed channel. `P` is the protocol and `E` is the environment,
 /// containing potential recursion targets
 #[must_use]
 #[derive(serde::Serialize, serde::Deserialize)]
-pub struct Chan<E, P>(Sender, Receiver, PhantomData<(E, P)>);
+pub struct Chan<E, P>(Sender<Packet>, Receiver<Packet>, PhantomData<(E, P)>);
 
 unsafe impl<E: marker::Send, P: marker::Send> marker::Send for Chan<E, P> {}
 
 unsafe fn write_chan<A: serde::Serialize, E, P>(&Chan(ref tx, _, _): &Chan<E, P>, x: A) {
-    let bytes = bincode::serialize(&x).unwrap();
-    tx.send(&bytes[..]).unwrap()
+    let content = serde_json::to_string(&x).unwrap();
+    tx.send(Packet { content }).unwrap()
 }
 
 unsafe fn read_chan<A, E, P>(&Chan(_, ref rx, _): &Chan<E, P>) -> A
 where for<'de> A: serde::Deserialize<'de> {
-    let bytes = rx.recv().unwrap();
-    bincode::deserialize(&bytes[..]).unwrap()
+    let Packet { content } = rx.recv().unwrap();
+    serde_json::from_str(&content[..]).unwrap()
 }
 
 unsafe fn try_read_chan<A, E, P>(
@@ -92,7 +97,7 @@ unsafe fn try_read_chan<A, E, P>(
 ) -> Option<A>
 where for<'de> A: serde::Deserialize<'de> {
     match rx.try_recv() {
-        Ok(bytes) => Some(bincode::deserialize(&bytes[..]).unwrap()),
+        Ok(Packet { content }) => Some(serde_json::from_str(&content[..]).unwrap()),
         Err(_) => None,
     }
 }
@@ -413,7 +418,7 @@ pub fn iselect<E, P, A>(chans: &Vec<Chan<E, Recv<A, P>>>) -> usize {
 /// The type parameter T is a return type, ie we store a value of some type T
 /// that is returned in case its associated channels is selected on `wait()`
 pub struct ChanSelect<'c> {
-    receivers: Vec<&'c Receiver>,
+    receivers: Vec<&'c Receiver<Packet>>,
 }
 
 impl<'c> ChanSelect<'c> {
