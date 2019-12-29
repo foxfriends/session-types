@@ -62,9 +62,10 @@
 use std::marker;
 use std::thread::spawn;
 use std::marker::PhantomData;
-// use std::collections::HashMap;
 
+use futures_util::StreamExt as _;
 use ipc_channel::ipc::{channel, IpcSender as Sender, IpcReceiver as Receiver};
+use ipc_channel::asynch::IpcStream as Stream;
 
 pub use Branch::*;
 
@@ -79,6 +80,14 @@ struct Packet {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Chan<E, P>(Sender<Packet>, Receiver<Packet>, PhantomData<(E, P)>);
 
+impl<E, P> Chan<E, P> {
+    pub fn to_async(self) -> ChanAsync<E, P> {
+        ChanAsync(self.0, self.1.to_stream(), PhantomData)
+    }
+}
+
+pub struct ChanAsync<E, P>(Sender<Packet>, Stream<Packet>, PhantomData<(E, P)>);
+
 unsafe impl<E: marker::Send, P: marker::Send> marker::Send for Chan<E, P> {}
 
 unsafe fn write_chan<A: serde::Serialize, E, P>(&Chan(ref tx, _, _): &Chan<E, P>, x: A) {
@@ -86,19 +95,38 @@ unsafe fn write_chan<A: serde::Serialize, E, P>(&Chan(ref tx, _, _): &Chan<E, P>
     tx.send(Packet { content }).unwrap()
 }
 
-unsafe fn read_chan<A, E, P>(&Chan(_, ref rx, _): &Chan<E, P>) -> A
-where for<'de> A: serde::Deserialize<'de> {
-    let Packet { content } = rx.recv().unwrap();
-    serde_json::from_str(&content[..]).unwrap()
+unsafe fn write_chan_async<A: serde::Serialize, E, P>(&ChanAsync(ref tx, _, _): &ChanAsync<E, P>, x: A) {
+    let content = serde_json::to_string(&x).unwrap();
+    tx.send(Packet { content }).unwrap()
 }
 
-unsafe fn try_read_chan<A, E, P>(
-    &Chan(_, ref rx, _): &Chan<E, P>,
-) -> Option<A>
+unsafe fn read_chan<A, E, P>(&Chan(_, ref rx, _): &Chan<E, P>) -> A
 where for<'de> A: serde::Deserialize<'de> {
-    match rx.try_recv() {
-        Ok(Packet { content }) => Some(serde_json::from_str(&content[..]).unwrap()),
-        Err(_) => None,
+    loop {
+        let message = rx.recv();
+        let Packet { content } = match message {
+            Err(..) => continue,
+            Ok(packet) => packet,
+        };
+        return match serde_json::from_str(&content[..]) {
+            Err(..) => continue,
+            Ok(response) => response,
+        }
+    }
+}
+
+async unsafe fn read_chan_async<A, E, P>(&mut ChanAsync(_, ref mut rx, _): &mut ChanAsync<E, P>) -> A
+where for<'de> A: serde::Deserialize<'de> {
+    loop {
+        let message = rx.next().await.unwrap();
+        let Packet { content } = match message {
+            Err(..) => continue,
+            Ok(packet) => packet,
+        };
+        return match serde_json::from_str(&content[..]) {
+            Err(..) => continue,
+            Ok(response) => response,
+        }
     }
 }
 
@@ -180,26 +208,23 @@ pub enum Branch<L, R> {
 
 impl<E> Chan<E, Eps> {
     /// Close a channel. Should always be used at the end of your program.
-    pub fn close(self) {
-        // This method cleans up the channel without running the panicky destructor
-        // In essence, it calls the drop glue bypassing the `Drop::drop` method
-        //
-        // Except, the panicky destructor has been removed for the IPC layer, so
-        // this doesn't do anything now!
+    pub fn close(self) { }
+}
 
-        // let this = mem::ManuallyDrop::new(self);
-
-        // let sender = unsafe { ptr::read(&(this).0 as *const _) };
-        // let receiver = unsafe { ptr::read(&(this).1 as *const _) };
-
-        // drop(sender);
-        // drop(receiver); // drop them
-    }
+impl<E> ChanAsync<E, Eps> {
+    /// Close a channel. Should always be used at the end of your program.
+    pub fn close(self) { }
 }
 
 impl<E, P> Chan<E, P> {
     unsafe fn cast<E2, P2>(self) -> Chan<E2, P2> {
         Chan(self.0, self.1, PhantomData)
+    }
+}
+
+impl<E, P> ChanAsync<E, P> {
+    unsafe fn cast<E2, P2>(self) -> ChanAsync<E2, P2> {
+        ChanAsync(self.0, self.1, PhantomData)
     }
 }
 
@@ -210,6 +235,18 @@ impl<E, P, A: serde::Serialize> Chan<E, Send<A, P>> {
     pub fn send(self, v: A) -> Chan<E, P> {
         unsafe {
             write_chan(&self, v);
+            self.cast()
+        }
+    }
+}
+
+impl<E, P, A: serde::Serialize> ChanAsync<E, Send<A, P>> {
+    /// Send a value of type `A` over the channel. Returns a channel with
+    /// protocol `P`
+    #[must_use]
+    pub fn send(self, v: A) -> ChanAsync<E, P> {
+        unsafe {
+            write_chan_async(&self, v);
             self.cast()
         }
     }
@@ -226,16 +263,17 @@ where for<'de> A: serde::Deserialize<'de> {
             (self.cast(), v)
         }
     }
+}
 
-    /// Non-blocking receive.
+impl<E, P, A> ChanAsync<E, Recv<A, P>>
+where for<'de> A: serde::Deserialize<'de> {
+    /// Receives a value of type `A` from the channel. Returns a tuple
+    /// containing the resulting channel and the received value.
     #[must_use]
-    pub fn try_recv(self) -> Result<(Chan<E, P>, A), Self> {
+    pub async fn recv(mut self) -> (ChanAsync<E, P>, A) {
         unsafe {
-            if let Some(v) = try_read_chan(&self) {
-                Ok((self.cast(), v))
-            } else {
-                Err(self)
-            }
+            let v = read_chan_async(&mut self).await;
+            (self.cast(), v)
         }
     }
 }
@@ -260,10 +298,38 @@ impl<E, P, Q> Chan<E, Choose<P, Q>> {
     }
 }
 
+impl<E, P, Q> ChanAsync<E, Choose<P, Q>> {
+    /// Perform an active choice, selecting protocol `P`.
+    #[must_use]
+    pub fn sel1(self) -> ChanAsync<E, P> {
+        unsafe {
+            write_chan_async(&self, true);
+            self.cast()
+        }
+    }
+
+    /// Perform an active choice, selecting protocol `Q`.
+    #[must_use]
+    pub fn sel2(self) -> ChanAsync<E, Q> {
+        unsafe {
+            write_chan_async(&self, false);
+            self.cast()
+        }
+    }
+}
+
 /// Convenience function. This is identical to `.sel2()`
 impl<Z, A, B> Chan<Z, Choose<A, B>> {
     #[must_use]
     pub fn skip(self) -> Chan<Z, B> {
+        self.sel2()
+    }
+}
+
+/// Convenience function. This is identical to `.sel2()`
+impl<Z, A, B> ChanAsync<Z, Choose<A, B>> {
+    #[must_use]
+    pub fn skip(self) -> ChanAsync<Z, B> {
         self.sel2()
     }
 }
@@ -276,10 +342,26 @@ impl<Z, A, B, C> Chan<Z, Choose<A, Choose<B, C>>> {
     }
 }
 
+/// Convenience function. This is identical to `.sel2().sel2()`
+impl<Z, A, B, C> ChanAsync<Z, Choose<A, Choose<B, C>>> {
+    #[must_use]
+    pub fn skip2(self) -> ChanAsync<Z, C> {
+        self.sel2().sel2()
+    }
+}
+
 /// Convenience function. This is identical to `.sel2().sel2().sel2()`
 impl<Z, A, B, C, D> Chan<Z, Choose<A, Choose<B, Choose<C, D>>>> {
     #[must_use]
     pub fn skip3(self) -> Chan<Z, D> {
+        self.sel2().sel2().sel2()
+    }
+}
+
+/// Convenience function. This is identical to `.sel2().sel2().sel2()`
+impl<Z, A, B, C, D> ChanAsync<Z, Choose<A, Choose<B, Choose<C, D>>>> {
+    #[must_use]
+    pub fn skip3(self) -> ChanAsync<Z, D> {
         self.sel2().sel2().sel2()
     }
 }
@@ -292,10 +374,26 @@ impl<Z, A, B, C, D, E> Chan<Z, Choose<A, Choose<B, Choose<C, Choose<D, E>>>>> {
     }
 }
 
+/// Convenience function. This is identical to `.sel2().sel2().sel2().sel2()`
+impl<Z, A, B, C, D, E> ChanAsync<Z, Choose<A, Choose<B, Choose<C, Choose<D, E>>>>> {
+    #[must_use]
+    pub fn skip4(self) -> ChanAsync<Z, E> {
+        self.sel2().sel2().sel2().sel2()
+    }
+}
+
 /// Convenience function. This is identical to `.sel2().sel2().sel2().sel2().sel2()`
 impl<Z, A, B, C, D, E, F> Chan<Z, Choose<A, Choose<B, Choose<C, Choose<D, Choose<E, F>>>>>> {
     #[must_use]
     pub fn skip5(self) -> Chan<Z, F> {
+        self.sel2().sel2().sel2().sel2().sel2()
+    }
+}
+
+/// Convenience function. This is identical to `.sel2().sel2().sel2().sel2().sel2()`
+impl<Z, A, B, C, D, E, F> ChanAsync<Z, Choose<A, Choose<B, Choose<C, Choose<D, Choose<E, F>>>>>> {
+    #[must_use]
+    pub fn skip5(self) -> ChanAsync<Z, F> {
         self.sel2().sel2().sel2().sel2().sel2()
     }
 }
@@ -310,10 +408,28 @@ impl<Z, A, B, C, D, E, F, G>
 }
 
 /// Convenience function.
+impl<Z, A, B, C, D, E, F, G>
+    ChanAsync<Z, Choose<A, Choose<B, Choose<C, Choose<D, Choose<E, Choose<F, G>>>>>>> {
+    #[must_use]
+    pub fn skip6(self) -> ChanAsync<Z, G> {
+        self.sel2().sel2().sel2().sel2().sel2().sel2()
+    }
+}
+
+/// Convenience function.
 impl<Z, A, B, C, D, E, F, G, H>
     Chan<Z, Choose<A, Choose<B, Choose<C, Choose<D, Choose<E, Choose<F, Choose<G, H>>>>>>>> {
     #[must_use]
     pub fn skip7(self) -> Chan<Z, H> {
+        self.sel2().sel2().sel2().sel2().sel2().sel2().sel2()
+    }
+}
+
+/// Convenience function.
+impl<Z, A, B, C, D, E, F, G, H>
+    ChanAsync<Z, Choose<A, Choose<B, Choose<C, Choose<D, Choose<E, Choose<F, Choose<G, H>>>>>>>> {
+    #[must_use]
+    pub fn skip7(self) -> ChanAsync<Z, H> {
         self.sel2().sel2().sel2().sel2().sel2().sel2().sel2()
     }
 }
@@ -332,19 +448,19 @@ impl<E, P, Q> Chan<E, Offer<P, Q>> {
             }
         }
     }
+}
 
-    /// Poll for choice.
+impl<E, P, Q> ChanAsync<E, Offer<P, Q>> {
+    /// Passive choice. This allows the other end of the channel to select one
+    /// of two options for continuing the protocol: either `P` or `Q`.
     #[must_use]
-    pub fn try_offer(self) -> Result<Branch<Chan<E, P>, Chan<E, Q>>, Self> {
+    pub async fn offer(mut self) -> Branch<ChanAsync<E, P>, ChanAsync<E, Q>> {
         unsafe {
-            if let Some(b) = try_read_chan(&self) {
-                if b {
-                    Ok(Left(self.cast()))
-                } else {
-                    Ok(Right(self.cast()))
-                }
+            let b = read_chan_async(&mut self).await;
+            if b {
+                Left(self.cast())
             } else {
-                Err(self)
+                Right(self.cast())
             }
         }
     }
@@ -359,10 +475,27 @@ impl<E, P> Chan<E, Rec<P>> {
     }
 }
 
+impl<E, P> ChanAsync<E, Rec<P>> {
+    /// Enter a recursive environment, putting the current environment on the
+    /// top of the environment stack.
+    #[must_use]
+    pub fn enter(self) -> ChanAsync<(P, E), P> {
+        unsafe { self.cast() }
+    }
+}
+
 impl<E, P> Chan<(P, E), Var<Z>> {
     /// Recurse to the environment on the top of the environment stack.
     #[must_use]
     pub fn zero(self) -> Chan<(P, E), P> {
+        unsafe { self.cast() }
+    }
+}
+
+impl<E, P> ChanAsync<(P, E), Var<Z>> {
+    /// Recurse to the environment on the top of the environment stack.
+    #[must_use]
+    pub fn zero(self) -> ChanAsync<(P, E), P> {
         unsafe { self.cast() }
     }
 }
@@ -375,88 +508,11 @@ impl<E, P, N> Chan<(P, E), Var<S<N>>> {
     }
 }
 
-/// Homogeneous select. We have a vector of channels, all obeying the same
-/// protocol (and in the exact same point of the protocol), wait for one of them
-/// to receive. Removes the receiving channel from the vector and returns both
-/// the channel and the new vector.
-#[must_use]
-pub fn hselect<E, P, A>(
-    mut chans: Vec<Chan<E, Recv<A, P>>>,
-) -> (Chan<E, Recv<A, P>>, Vec<Chan<E, Recv<A, P>>>) {
-    let i = iselect(&chans);
-    let c = chans.remove(i);
-    (c, chans)
-}
-
-/// An alternative version of homogeneous select, returning the index of the Chan
-/// that is ready to receive.
-pub fn iselect<E, P, A>(chans: &Vec<Chan<E, Recv<A, P>>>) -> usize {
-    // let mut map = HashMap::new();
-
-    let id = {
-        let mut sel = unimplemented!("Select is not implemented for IPC channels"); // Select::new();
-        // let mut handles = Vec::with_capacity(chans.len()); // collect all the handles
-
-        // for (i, chan) in chans.iter().enumerate() {
-        //     let &Chan(_, ref rx, _) = chan;
-        //     let handle = sel.recv(rx);
-        //     map.insert(handle, i);
-        //     handles.push(handle);
-        // }
-
-        // let id = sel.ready();
-        // id
-    };
-    // map.remove(&id).unwrap()
-}
-
-/// Heterogeneous selection structure for channels
-///
-/// This builds a structure of channels that we wish to select over. This is
-/// structured in a way such that the channels selected over cannot be
-/// interacted with (consumed) as long as the borrowing ChanSelect object
-/// exists. This is necessary to ensure memory safety.
-///
-/// The type parameter T is a return type, ie we store a value of some type T
-/// that is returned in case its associated channels is selected on `wait()`
-pub struct ChanSelect<'c> {
-    receivers: Vec<&'c Receiver<Packet>>,
-}
-
-impl<'c> ChanSelect<'c> {
-    pub fn new() -> ChanSelect<'c> {
-        ChanSelect { receivers: Vec::new() }
-    }
-
-    /// Add a channel whose next step is `Recv`
-    ///
-    /// Once a channel has been added it cannot be interacted with as long as it
-    /// is borrowed here (by virtue of borrow checking and lifetimes).
-    pub fn add_recv<E, P, A: marker::Send>(&mut self, chan: &'c Chan<E, Recv<A, P>>) {
-        let &Chan(_, ref rx, _) = chan;
-        let _ = self.receivers.push(rx);
-    }
-
-    pub fn add_offer<E, P, Q>(&mut self, chan: &'c Chan<E, Offer<P, Q>>) {
-        let &Chan(_, ref rx, _) = chan;
-        let _ = self.receivers.push(rx);
-    }
-
-    /// Find a Receiver (and hence a Chan) that is ready to receive.
-    ///
-    /// This method consumes the ChanSelect, freeing up the borrowed Receivers
-    /// to be consumed.
-    pub fn wait(self) -> usize {
-        let mut sel = unimplemented!("Select is not implemented for IPC channels"); // Select::new();
-        // for rx in self.receivers.into_iter() {
-        //     sel.recv(rx);
-        // }
-        // sel.ready()
-    }
-
-    /// How many channels are there in the structure?
-    pub fn len(&self) -> usize {
-        self.receivers.len()
+impl<E, P, N> ChanAsync<(P, E), Var<S<N>>> {
+    /// Pop the top environment from the environment stack.
+    #[must_use]
+    pub fn succ(self) -> ChanAsync<E, Var<N>> {
+        unsafe { self.cast() }
     }
 }
 
@@ -498,220 +554,4 @@ mod private {
     impl<P, Q> Sealed for Offer<P, Q> {}
     impl<Z> Sealed for Var<Z> {}
     impl<P> Sealed for Rec<P> {}
-}
-
-/// This macro is convenient for server-like protocols of the form:
-///
-/// `Offer<A, Offer<B, Offer<C, ... >>>`
-///
-/// # Examples
-///
-/// Assume we have a protocol `Offer<Recv<u64, Eps>, Offer<Recv<String, Eps>,Eps>>>`
-/// we can use the `offer!` macro as follows:
-///
-/// ```rust
-/// extern crate session_types;
-/// use session_types::*;
-/// use std::thread::spawn;
-///
-/// fn srv(c: Chan<(), Offer<Recv<u64, Eps>, Offer<Recv<String, Eps>, Eps>>>) {
-///     offer! { c,
-///         Number => {
-///             let (c, n) = c.recv();
-///             assert_eq!(42, n);
-///             c.close();
-///         },
-///         String => {
-///             c.recv().0.close();
-///         },
-///         Quit => {
-///             c.close();
-///         }
-///     }
-/// }
-///
-/// fn cli(c: Chan<(), Choose<Send<u64, Eps>, Choose<Send<String, Eps>, Eps>>>) {
-///     c.sel1().send(42).close();
-/// }
-///
-/// fn main() {
-///     let (s, c) = session_channel();
-///     spawn(move|| cli(c));
-///     srv(s);
-/// }
-/// ```
-///
-/// The identifiers on the left-hand side of the arrows have no semantic
-/// meaning, they only provide a meaningful name for the reader.
-#[macro_export]
-macro_rules! offer {
-    (
-        $id:ident, $branch:ident => $code:expr, $($t:tt)+
-    ) => (
-        match $id.offer() {
-            $crate::Left($id) => $code,
-            $crate::Right($id) => offer!{ $id, $($t)+ }
-        }
-    );
-    (
-        $id:ident, $branch:ident => $code:expr
-    ) => (
-        $code
-    )
-}
-
-/// Returns the channel unchanged on `TryRecvError::Empty`.
-#[macro_export]
-macro_rules! try_offer {
-    (
-        $id:ident, $branch:ident => $code:expr, $($t:tt)+
-    ) => (
-        match $id.try_offer() {
-            Ok($crate::Left($id)) => $code,
-            Ok($crate::Right($id)) => try_offer!{ $id, $($t)+ },
-            Err($id) => Err($id)
-        }
-    );
-    (
-        $id:ident, $branch:ident => $code:expr
-    ) => (
-        $code
-    )
-}
-
-/// This macro plays the same role as the `select!` macro does for `Receiver`s.
-///
-/// It also supports a second form with `Offer`s (see the example below).
-///
-/// # Examples
-///
-/// ```rust
-/// extern crate session_types;
-/// use session_types::*;
-/// use std::thread::spawn;
-///
-/// fn send_str(c: Chan<(), Send<String, Eps>>) {
-///     c.send("Hello, World!".to_string()).close();
-/// }
-///
-/// fn send_usize(c: Chan<(), Send<usize, Eps>>) {
-///     c.send(42).close();
-/// }
-///
-/// fn main() {
-///     let (tcs, rcs) = session_channel();
-///     let (tcu, rcu) = session_channel();
-///
-///     // Spawn threads
-///     spawn(move|| send_str(tcs));
-///     spawn(move|| send_usize(tcu));
-///
-///     chan_select! {
-///         (c, s) = rcs.recv() => {
-///             assert_eq!("Hello, World!".to_string(), s);
-///             c.close();
-///             rcu.recv().0.close();
-///         },
-///         (c, i) = rcu.recv() => {
-///             assert_eq!(42, i);
-///             c.close();
-///             rcs.recv().0.close();
-///         }
-///     }
-/// }
-/// ```
-///
-/// ```rust
-/// extern crate session_types;
-/// extern crate rand;
-///
-/// use std::thread::spawn;
-/// use session_types::*;
-///
-/// type Igo = Choose<Send<String, Eps>, Send<u64, Eps>>;
-/// type Ugo = Offer<Recv<String, Eps>, Recv<u64, Eps>>;
-///
-/// fn srv(chan_one: Chan<(), Ugo>, chan_two: Chan<(), Ugo>) {
-///     let _ign;
-///     chan_select! {
-///         _ign = chan_one.offer() => {
-///             String => {
-///                 let (c, s) = chan_one.recv();
-///                 assert_eq!("Hello, World!".to_string(), s);
-///                 c.close();
-///                 match chan_two.offer() {
-///                     Left(c) => c.recv().0.close(),
-///                     Right(c) => c.recv().0.close(),
-///                 }
-///             },
-///             Number => {
-///                 chan_one.recv().0.close();
-///                 match chan_two.offer() {
-///                     Left(c) => c.recv().0.close(),
-///                     Right(c) => c.recv().0.close(),
-///                 }
-///             }
-///         },
-///         _ign = chan_two.offer() => {
-///             String => {
-///                 chan_two.recv().0.close();
-///                 match chan_one.offer() {
-///                     Left(c) => c.recv().0.close(),
-///                     Right(c) => c.recv().0.close(),
-///                 }
-///             },
-///             Number => {
-///                 chan_two.recv().0.close();
-///                 match chan_one.offer() {
-///                     Left(c) => c.recv().0.close(),
-///                     Right(c) => c.recv().0.close(),
-///                 }
-///             }
-///         }
-///     }
-/// }
-///
-/// fn cli(c: Chan<(), Igo>) {
-///     c.sel1().send("Hello, World!".to_string()).close();
-/// }
-///
-/// fn main() {
-///     let (ca1, ca2) = session_channel();
-///     let (cb1, cb2) = session_channel();
-///
-///     cb2.sel2().send(42).close();
-///
-///     spawn(move|| cli(ca2));
-///
-///     srv(ca1, cb1);
-/// }
-/// ```
-#[macro_export]
-macro_rules! chan_select {
-    (
-        $(($c:ident, $name:pat) = $rx:ident.recv() => $code:expr),+
-    ) => ({
-        let index = {
-            let mut sel = $crate::ChanSelect::new();
-            $( sel.add_recv(&$rx); )+
-            sel.wait()
-        };
-        let mut i = 0;
-        $( if index == { i += 1; i - 1 } { let ($c, $name) = $rx.recv(); $code }
-           else )+
-        { unreachable!() }
-    });
-
-    (
-        $($res:ident = $rx:ident.offer() => { $($t:tt)+ }),+
-    ) => ({
-        let index = {
-            let mut sel = $crate::ChanSelect::new();
-            $( sel.add_offer(&$rx); )+
-            sel.wait()
-        };
-        let mut i = 0;
-        $( if index == { i += 1; i - 1 } { $res = offer!{ $rx, $($t)+ } } else )+
-        { unreachable!() }
-    })
 }

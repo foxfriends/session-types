@@ -15,7 +15,8 @@ edition = "2018"
 license = "MIT"
 
 [dependencies]
-ipc-channel = "0.13"
+futures-util = "0.3"
+ipc-channel = { git = "https://github.com/foxfriends/ipc-channel.git", branch = "master", features = ["async"] }
 serde = "1.0"
 serde_json = "1.0"
 
