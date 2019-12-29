@@ -555,3 +555,74 @@ mod private {
     impl<Z> Sealed for Var<Z> {}
     impl<P> Sealed for Rec<P> {}
 }
+
+/// This macro is convenient for server-like protocols of the form:
+///
+/// `Offer<A, Offer<B, Offer<C, ... >>>`
+///
+/// # Examples
+///
+/// Assume we have a protocol `Offer<Recv<u64, Eps>, Offer<Recv<String, Eps>,Eps>>>`
+/// we can use the `offer!` macro as follows:
+///
+/// ```rust
+/// extern crate session_types;
+/// use session_types::*;
+/// use std::thread::spawn;
+///
+/// fn srv(c: Chan<(), Offer<Recv<u64, Eps>, Offer<Recv<String, Eps>, Eps>>>) {
+///     offer! { c,
+///         Number => {
+///             let (c, n) = c.recv();
+///             assert_eq!(42, n);
+///             c.close();
+///         },
+///         String => {
+///             c.recv().0.close();
+///         },
+///         Quit => {
+///             c.close();
+///         }
+///     }
+/// }
+///
+/// fn cli(c: Chan<(), Choose<Send<u64, Eps>, Choose<Send<String, Eps>, Eps>>>) {
+///     c.sel1().send(42).close();
+/// }
+///
+/// fn main() {
+///     let (s, c) = session_channel();
+///     spawn(move|| cli(c));
+///     srv(s);
+/// }
+/// ```
+///
+/// The identifiers on the left-hand side of the arrows have no semantic
+/// meaning, they only provide a meaningful name for the reader.
+#[macro_export]
+macro_rules! offer {
+    ($id:ident, $branch:ident => $code:expr, $($t:tt)+) => (
+        match $id.offer() {
+            $crate::Left($id) => $code,
+            $crate::Right($id) => offer!{ $id, $($t)+ }
+        }
+    );
+    ($id:ident, $branch:ident => $code:expr) => ($code)
+}
+
+#[macro_export]
+macro_rules! offer_async {
+    ($id:ident, $branch:ident => $code:expr, $($t:tt)+) => (
+        match $id.offer().await {
+            $crate::Left($id) => $code,
+            $crate::Right($id) => offer_async!{ $id, $($t)+ }
+        }
+    );
+    ($id:ident, $branch:ident => $code:expr) => ($code)
+}
+
+#[macro_export]
+macro_rules! choose {
+    ($choice:ty, $($t:tt)+) => (Choose<$choice, choose!($($t)+)>);
+    ($choice:ty) => ($choice)
+}
