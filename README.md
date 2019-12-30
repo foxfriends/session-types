@@ -1,3 +1,9 @@
+NOTE: This is a fork of the original session types, which uses `ipc-channel` to facilitate
+using session types for communication between processes. This makes a number of assumptions
+on the usage of the library, which are not documented, as this is mainly to power a personal
+project. If the features used here are desired for other uses, it would be best to come up with
+another implementation.
+
 Session Types for Rust
 ----------------------
 
