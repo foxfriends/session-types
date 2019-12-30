@@ -601,28 +601,40 @@ mod private {
 /// meaning, they only provide a meaningful name for the reader.
 #[macro_export]
 macro_rules! offer {
+    ($id:ident, $branch:ident => $code:block $($t:tt)+) => (
+        match $id.offer() {
+            $crate::Left($id) => $code,
+            $crate::Right($id) => offer!{ $id, $($t)+ }
+        }
+    );
     ($id:ident, $branch:ident => $code:expr, $($t:tt)+) => (
         match $id.offer() {
             $crate::Left($id) => $code,
             $crate::Right($id) => offer!{ $id, $($t)+ }
         }
     );
-    ($id:ident, $branch:ident => $code:expr) => ($code)
+    ($id:ident, $branch:ident => $code:expr $(,)?) => ($code)
 }
 
 #[macro_export]
 macro_rules! offer_async {
+    ($id:ident, $branch:ident => $code:block $($t:tt)+) => (
+        match $id.offer().await {
+            $crate::Left($id) => $code,
+            $crate::Right($id) => offer_async!{ $id, $($t)+ }
+        }
+    );
     ($id:ident, $branch:ident => $code:expr, $($t:tt)+) => (
         match $id.offer().await {
             $crate::Left($id) => $code,
             $crate::Right($id) => offer_async!{ $id, $($t)+ }
         }
     );
-    ($id:ident, $branch:ident => $code:expr) => ($code)
+    ($id:ident, $branch:ident => $code:expr $(,)?) => ($code)
 }
 
 #[macro_export]
 macro_rules! choose {
     ($choice:ty, $($t:tt)+) => (Choose<$choice, choose!($($t)+)>);
-    ($choice:ty) => ($choice)
+    ($choice:ty $(,)?) => ($choice)
 }
