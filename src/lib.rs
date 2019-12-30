@@ -69,6 +69,8 @@ use ipc_channel::asynch::IpcStream as Stream;
 
 pub use Branch::*;
 
+pub mod util;
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Packet {
     content: String,
